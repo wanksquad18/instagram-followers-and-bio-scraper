@@ -9,6 +9,94 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import NoSuchElementException
 import re
 import pandas as pd
+# ----------------- BEGIN: cookie helpers (paste near imports) -----------------
+import json
+from typing import List, Dict
+
+def load_cookies_from_env_or_file(env_name="COOKIES_SECRET", file_paths=None):
+    """
+    Returns a list of cookie dicts or None.
+    Accepts either:
+      - COOKIES_SECRET env with JSON array string of cookies OR
+      - COOKIES_SECRET env equal to the raw sessionid string
+      - file paths (list) to try reading JSON from repo
+    """
+    cookie_raw = os.environ.get(env_name)
+    if cookie_raw:
+        try:
+            parsed = json.loads(cookie_raw)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                for v in parsed.values():
+                    if isinstance(v, list):
+                        return v
+        except Exception:
+            # Not JSON — maybe raw sessionid string
+            if cookie_raw and len(cookie_raw) > 10 and "=" not in cookie_raw:
+                return [{"name": "sessionid", "value": cookie_raw, "domain": ".instagram.com", "path": "/"}]
+    if file_paths:
+        for p in file_paths:
+            try:
+                if os.path.exists(p):
+                    parsed = json.load(open(p, encoding="utf-8"))
+                    if isinstance(parsed, list):
+                        return parsed
+            except Exception:
+                continue
+    return None
+
+def normalize_cookies_for_selenium(cookie_list: List[Dict]) -> List[Dict]:
+    out = []
+    for c in cookie_list:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name"); value = c.get("value")
+        if not name or value is None:
+            continue
+        cd = {"name": name, "value": str(value)}
+        cd["domain"] = c.get("domain", ".instagram.com")
+        cd["path"] = c.get("path", "/")
+        if "expires" in c:
+            try:
+                cd["expiry"] = int(c["expires"])
+            except Exception:
+                pass
+        out.append(cd)
+    return out
+
+def inject_cookies_into_driver(driver, cookie_list, base_url="https://www.instagram.com"):
+    if not cookie_list:
+        print("[cookies] no cookies to inject")
+        return False
+    try:
+        driver.get(base_url)
+        time.sleep(1.0)
+    except Exception as e:
+        print("[cookies] warning: initial GET failed:", e)
+    selenium_cookies = normalize_cookies_for_selenium(cookie_list)
+    added = 0
+    for c in selenium_cookies:
+        try:
+            try:
+                driver.delete_cookie(c["name"])
+            except Exception:
+                pass
+            driver.add_cookie(c)
+            added += 1
+        except Exception as e:
+            try:
+                c2 = c.copy()
+                if c2.get("domain","").startswith("."):
+                    c2["domain"] = c2["domain"].lstrip(".")
+                driver.add_cookie(c2)
+                added += 1
+            except Exception as e2:
+                print("[cookies] failed to add cookie", c.get("name"), ":", e2)
+    print(f"[cookies] injected {added} cookies")
+    return added > 0
+# ----------------- END: cookie helpers -----------------
+
 
 
 def save_credentials(username, password):

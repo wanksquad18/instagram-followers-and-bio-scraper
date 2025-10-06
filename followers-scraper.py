@@ -230,7 +230,21 @@ options.add_experimental_option("mobileEmulation", mobile_emulation)
 
 bot = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
 
+   bot = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
+
+# Try cookie-based login first
+cookie_list = load_cookies_from_env_or_file(
+    env_name="COOKIES_SECRET",
+    file_paths=["data/www.instagram.com.cookies.json","www.instagram.com.cookies.json","cookies/www.instagram.com.cookies.json"]
+)
+if cookie_list:
+    print("[Info] - Found cookies in secret or files; injecting into browser")
+    inject_cookies_into_driver(bot, cookie_list)
+    time.sleep(2)
+else:
+    # fallback to username/password interactive login (existing behavior)
     login(bot, username, password)
+
 
     for user in usernames:
         user = user.strip()

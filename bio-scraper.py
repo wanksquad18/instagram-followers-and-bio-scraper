@@ -206,7 +206,12 @@ def scrape():
     else:
         username, password = credentials
 
+   usernames_env = os.environ.get("TARGET_USERNAMES") or os.environ.get("TARGET_USERNAME")
+if usernames_env:
+    usernames = [u.strip() for u in usernames_env.split(",") if u.strip()]
+else:
     usernames = input("Enter the Instagram usernames you want to scrape (separated by commas): ").split(",")
+
 
 options = webdriver.ChromeOptions()
 # run headless in Actions / CI

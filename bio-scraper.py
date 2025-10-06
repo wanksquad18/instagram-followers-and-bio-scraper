@@ -1,5 +1,17 @@
-import time
+#!/usr/bin/env python3
+# bio-scraper.py
+# Headless Selenium bio extractor with cookie injection.
+# Writes matching bios to descriptions.csv (creates if missing).
+# Usage: TARGET_USERNAMES="user1,user2" python bio-scraper.py
+
 import os
+import time
+import json
+import traceback
+import re
+from typing import List, Dict
+
+import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -7,24 +19,22 @@ from selenium.webdriver.support import expected_conditions as ec
 from selenium.webdriver.chrome.service import Service as ChromeService
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import NoSuchElementException
-import re
-import pandas as pd
-# ----------------- BEGIN: cookie helpers (paste near imports) -----------------
-import json
-from typing import List, Dict
 
+# ----- Config -----
+COOKIE_PATHS = [
+    "data/www.instagram.com.cookies.json",
+    "www.instagram.com.cookies.json",
+    "cookies/www.instagram.com.cookies.json",
+]
+TIMEOUT = 15
+
+# ---------------- cookie helpers ----------------
 def load_cookies_from_env_or_file(env_name="COOKIES_SECRET", file_paths=None):
-    """
-    Returns a list of cookie dicts or None.
-    Accepts either:
-      - COOKIES_SECRET env with JSON array string of cookies OR
-      - COOKIES_SECRET env equal to the raw sessionid string
-      - file paths (list) to try reading JSON from repo
-    """
-    cookie_raw = os.environ.get(env_name)
-    if cookie_raw:
+    file_paths = file_paths or COOKIE_PATHS
+    raw = os.environ.get(env_name)
+    if raw:
         try:
-            parsed = json.loads(cookie_raw)
+            parsed = json.loads(raw)
             if isinstance(parsed, list):
                 return parsed
             if isinstance(parsed, dict):
@@ -32,228 +42,289 @@ def load_cookies_from_env_or_file(env_name="COOKIES_SECRET", file_paths=None):
                     if isinstance(v, list):
                         return v
         except Exception:
-            # Not JSON — maybe raw sessionid string
-            if cookie_raw and len(cookie_raw) > 10 and "=" not in cookie_raw:
-                return [{"name": "sessionid", "value": cookie_raw, "domain": ".instagram.com", "path": "/"}]
-    if file_paths:
-        for p in file_paths:
+            if raw and len(raw) > 10 and "=" not in raw:
+                return [{"name": "sessionid", "value": raw, "domain": ".instagram.com", "path": "/"}]
+    for p in file_paths:
+        if os.path.exists(p):
             try:
-                if os.path.exists(p):
-                    parsed = json.load(open(p, encoding="utf-8"))
-                    if isinstance(parsed, list):
-                        return parsed
+                parsed = json.load(open(p, encoding="utf-8"))
+                if isinstance(parsed, list):
+                    return parsed
             except Exception:
                 continue
     return None
 
-def normalize_cookies_for_selenium(cookie_list: List[Dict]) -> List[Dict]:
-    out = []
-    for c in cookie_list:
-        if not isinstance(c, dict):
-            continue
-        name = c.get("name"); value = c.get("value")
-        if not name or value is None:
-            continue
-        cd = {"name": name, "value": str(value)}
-        cd["domain"] = c.get("domain", ".instagram.com")
-        cd["path"] = c.get("path", "/")
-        if "expires" in c:
-            try:
-                cd["expiry"] = int(c["expires"])
-            except Exception:
-                pass
-        out.append(cd)
-    return out
+def normalize_cookie_for_selenium(c):
+    cd = {"name": c.get("name"), "value": str(c.get("value", ""))}
+    domain = c.get("domain", ".instagram.com")
+    cd["domain"] = domain
+    cd["path"] = c.get("path", "/")
+    if "expires" in c:
+        try:
+            cd["expiry"] = int(c["expires"])
+        except Exception:
+            pass
+    elif "expiry" in c:
+        try:
+            cd["expiry"] = int(c["expiry"])
+        except Exception:
+            pass
+    return cd
 
-def inject_cookies_into_driver(driver, cookie_list, base_url="https://www.instagram.com"):
+def inject_cookies_into_driver(driver, cookie_list, base_url="https://www.instagram.com/"):
     if not cookie_list:
-        print("[cookies] no cookies to inject")
-        return False
+        print("[cookies] no cookie list provided")
+        return 0
     try:
         driver.get(base_url)
         time.sleep(1.0)
     except Exception as e:
         print("[cookies] warning: initial GET failed:", e)
-    selenium_cookies = normalize_cookies_for_selenium(cookie_list)
     added = 0
-    for c in selenium_cookies:
+    for raw in cookie_list:
         try:
+            cookie = normalize_cookie_for_selenium(raw)
+            if not cookie.get("name") or cookie.get("value") is None:
+                continue
             try:
-                driver.delete_cookie(c["name"])
+                driver.delete_cookie(cookie["name"])
             except Exception:
                 pass
-            driver.add_cookie(c)
-            added += 1
-        except Exception as e:
             try:
-                c2 = c.copy()
-                if c2.get("domain","").startswith("."):
-                    c2["domain"] = c2["domain"].lstrip(".")
-                driver.add_cookie(c2)
+                driver.add_cookie(cookie)
                 added += 1
-            except Exception as e2:
-                print("[cookies] failed to add cookie", c.get("name"), ":", e2)
+            except Exception:
+                c2 = cookie.copy()
+                if c2.get("domain", "").startswith("."):
+                    c2["domain"] = c2["domain"].lstrip(".")
+                try:
+                    driver.add_cookie(c2)
+                    added += 1
+                except Exception as e2:
+                    print("[cookies] cannot add cookie", cookie.get("name"), ":", e2)
+        except Exception as e:
+            print("[cookies] normalize/add failed:", e)
     print(f"[cookies] injected {added} cookies")
-    return added > 0
-# ----------------- END: cookie helpers -----------------
+    return added
 
+# ---------------- utilities ----------------
+def get_target_usernames():
+    env = os.environ.get("TARGET_USERNAMES") or os.environ.get("TARGET_USERNAME") or os.environ.get("SINGLE_USERNAME")
+    if env:
+        return [u.strip().lstrip("@") for u in env.split(",") if u.strip()]
+    if os.path.exists("usernames.txt"):
+        with open("usernames.txt", "r", encoding="utf-8") as fh:
+            return [l.strip().lstrip("@") for l in fh if l.strip()]
+    raw = input("Enter usernames (comma-separated): ")
+    return [u.strip().lstrip("@") for u in raw.split(",") if u.strip()]
 
+def ensure_descriptions_csv():
+    if not os.path.exists('descriptions.csv'):
+        df = pd.DataFrame(columns=['username', 'description', 'link'])
+        df.to_csv('descriptions.csv', index=False, encoding='utf-8')
 
+def save_debug(driver, name_prefix):
+    try:
+        os.makedirs("data", exist_ok=True)
+        ts = int(time.time())
+        safe = name_prefix.replace("/", "_")
+        html_path = f"data/debug_{safe}_{ts}.html"
+        png_path = f"data/debug_{safe}_{ts}.png"
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write(driver.page_source)
+        driver.save_screenshot(png_path)
+        print("Saved debug artifacts:", html_path, png_path)
+    except Exception as e:
+        print("Failed to save debug artifacts:", e)
+
+# ---------------- login fallback ----------------
 def save_credentials(username, password):
-    with open('credentials.txt', 'w') as file:
-        file.write(f"{username}\n{password}")
-
+    try:
+        with open('credentials.txt', 'w', encoding='utf-8') as fh:
+            fh.write(username + "\n" + password + "\n")
+    except Exception:
+        pass
 
 def load_credentials():
-    if not os.path.exists('credentials.txt'):
-        return None
-
-    with open('credentials.txt', 'r') as file:
-        lines = file.readlines()
-        if len(lines) >= 2:
-            return lines[0].strip(), lines[1].strip()
-
+    if os.path.exists('credentials.txt'):
+        try:
+            with open('credentials.txt', 'r', encoding='utf-8') as fh:
+                lines = [l.strip() for l in fh.readlines()]
+                if len(lines) >= 2:
+                    return lines[0], lines[1]
+        except Exception:
+            pass
     return None
 
-
 def prompt_credentials():
-    username = input("Enter your Instagram username: ")
-    password = input("Enter your Instagram password: ")
-    save_credentials(username, password)
-    return username, password
-
+    u = input("Enter Instagram username: ").strip()
+    p = input("Enter Instagram password: ").strip()
+    save_credentials(u, p)
+    return u, p
 
 def login(bot, username, password):
-    bot.get('https://www.instagram.com/accounts/login/')
-    time.sleep(2)
-
-    # Check if cookies need to be accepted
     try:
-        element = bot.find_element(By.XPATH, "/html/body/div[4]/div/div/div[3]/div[2]/button")
-        element.click()
-    except NoSuchElementException:
-        print("[Info] - Instagram did not require to accept cookies this time.")
+        bot.get('https://www.instagram.com/accounts/login/')
+        time.sleep(2)
+        try:
+            elt = bot.find_element(By.XPATH, "/html/body/div[4]/div/div/div[3]/div[2]/button")
+            elt.click()
+        except NoSuchElementException:
+            pass
+        username_input = WebDriverWait(bot, 10).until(ec.element_to_be_clickable((By.CSS_SELECTOR, "input[name='username']")))
+        password_input = WebDriverWait(bot, 10).until(ec.element_to_be_clickable((By.CSS_SELECTOR, "input[name='password']")))
+        username_input.clear()
+        username_input.send_keys(username)
+        password_input.clear()
+        password_input.send_keys(password)
+        login_button = WebDriverWait(bot, 10).until(ec.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']")))
+        login_button.click()
+        time.sleep(8)
+    except Exception as e:
+        print("Login error:", e)
+        traceback.print_exc()
 
-    print("[Info] - Logging in...")
-    username_input = WebDriverWait(bot, 10).until(
-        ec.element_to_be_clickable((By.CSS_SELECTOR, "input[name='username']")))
-    password_input = WebDriverWait(bot, 10).until(
-        ec.element_to_be_clickable((By.CSS_SELECTOR, "input[name='password']")))
-
-    username_input.clear()
-    username_input.send_keys(username)
-    password_input.clear()
-    password_input.send_keys(password)
-
-    login_button = WebDriverWait(bot, 2).until(ec.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']")))
-    login_button.click()
-    time.sleep(10)
-
-
-def scrape_description(bot, username):
-    bot.get(f'https://www.instagram.com/{username}/')
-
-    print(f"[Info] - Scraping description for {username}...")
-    time.sleep(5)
-
-    user_description = dict()
-
-    # check the account bio
+# ---------------- scraping logic ----------------
+def extract_bio_from_profile(bot, username):
+    url = f"https://www.instagram.com/{username}/"
+    print("[bio] opening", url)
+    bot.get(url)
+    time.sleep(4)
     try:
-        description = bot.find_element(By.TAG_NAME, 'h1').text.lower()
-    except:
-        description = ''
+        # full name or header h1 could be present
+        bio_text = ""
+        try:
+            # Instagram DOM can vary; try a few selectors
+            possible = bot.find_elements(By.CSS_SELECTOR, "header section div.-vDIg span") \
+                       or bot.find_elements(By.CSS_SELECTOR, "header section div.-vDIg") \
+                       or bot.find_elements(By.TAG_NAME, "h1")
+            for el in possible:
+                txt = el.text.strip()
+                if txt:
+                    bio_text = txt
+                    break
+        except Exception:
+            pass
 
-    # check the link in bio
-    link = ''
+        # fallback: parse meta description content
+        if not bio_text:
+            try:
+                meta = bot.find_element(By.CSS_SELECTOR, 'meta[name="description"]')
+                bio_text = meta.get_attribute("content") or ""
+            except Exception:
+                pass
+
+        # find bio link (link in bio often rewritten via l.instagram.com)
+        link = ""
+        try:
+            src = bot.page_source
+            urls = re.findall(r'href=[\'"]?([^\'" >]+)', src)
+            for u in urls:
+                if re.match(r'https://l\.instagram\.com/\?u=(.*)', u):
+                    link = u
+                    break
+        except Exception:
+            link = ""
+
+        return bio_text.strip(), link
+    except Exception as e:
+        print("[bio] error extracting bio for", username, e)
+        try:
+            save_debug(bot, username)
+        except Exception:
+            pass
+        return "", ""
+
+def build_driver(headless=True):
+    options = webdriver.ChromeOptions()
+    if headless:
+        options.add_argument('--headless=new')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--window-size=1280,800')
+    service = ChromeService(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+    return driver
+
+def main():
+    ensure_descriptions_csv = ensure_descriptions_csv  # alias for readability
+    ensure_descriptions_csv()
+    usernames = get_target_usernames()
+    if not usernames:
+        print("No usernames supplied")
+        return
+
     try:
-        html_source = bot.page_source
-        urls = re.findall(r'href=[\'"]?([^\'" >]+)', html_source)
-        for url in urls:
-            if re.match(r'https://l\.instagram\.com/\?u=(.*)', url):
-                link = url
-                break
-    except:
-        link = ''
+        driver = build_driver(headless=True)
+    except Exception as e:
+        print("Failed to build driver:", e)
+        traceback.print_exc()
+        return
 
-    # words (in lower case) you need to find in the bio or link
-    word_list = ['journalist', 'reporter', 'correspondent', 'editor', 'news', 'columnist', 'writer', 'commentator',
-                 'blogger', 'reviewer']
-
-    df_descriptions = pd.read_csv('descriptions.csv', encoding="utf-8")
-
-    # look for words from the list in the bio or link, if there is a match, add that account to the csv file
-    for word in word_list:
-        if (word in description) or (word in link):
-            user_description['username'] = [username]
-            user_description['description'] = [description]
-            user_description['link'] = [link]
-            df_user = pd.DataFrame.from_dict(user_description)
-            df_descriptions = pd.concat([df_descriptions, df_user])
-            break
-
-    print(f"[Info] - Saving descriptions for {username}...")
-
-    df_descriptions.to_csv('descriptions.csv', encoding='utf-8', index=False)
-    time.sleep(10)
-
-
-def scrape():
-    credentials = load_credentials()
-
-    if credentials is None:
-        username, password = prompt_credentials()
+    cookie_list = load_cookies_from_env_or_file()
+    if cookie_list:
+        print("[main] injecting cookies")
+        inject_cookies_into_driver(driver, cookie_list)
+        time.sleep(1)
     else:
-        username, password = credentials
+        print("[main] no cookies found; will try fallback login if credentials available")
 
-   usernames_env = os.environ.get("TARGET_USERNAMES") or os.environ.get("TARGET_USERNAME")
-if usernames_env:
-    usernames = [u.strip() for u in usernames_env.split(",") if u.strip()]
-else:
-    usernames = input("Enter the Instagram usernames you want to scrape (separated by commas): ").split(",")
+    try:
+        driver.get("https://www.instagram.com/")
+        time.sleep(1.5)
+        title = driver.title or ""
+        if "Log in" in title or "Login" in title:
+            print("[main] login page detected after cookie injection; cookies may be invalid")
+            creds = load_credentials()
+            if creds:
+                login(driver, creds[0], creds[1])
+            else:
+                print("[main] no credentials saved; continuing (may not return full bios)")
+    except Exception:
+        pass
 
+    df = pd.read_csv('descriptions.csv', encoding='utf-8') if os.path.exists('descriptions.csv') else pd.DataFrame(columns=['username','description','link'])
 
-options = webdriver.ChromeOptions()
-# run headless in Actions / CI
-options.add_argument('--headless=new')   # if runner errors, use '--headless'
-options.add_argument('--no-sandbox')
-options.add_argument('--disable-dev-shm-usage')
-options.add_argument('--disable-gpu')
-options.add_argument('--window-size=1280,800')
-mobile_emulation = {
-    "userAgent": "Mozilla/5.0 (Linux; Android 10; SM-G970F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.106 Mobile Safari/537.36"
-}
-options.add_experimental_option("mobileEmulation", mobile_emulation)
-
-bot = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
-
-   bot = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
-
-# Try cookie-based login first
-cookie_list = load_cookies_from_env_or_file(
-    env_name="COOKIES_SECRET",
-    file_paths=["data/www.instagram.com.cookies.json","www.instagram.com.cookies.json","cookies/www.instagram.com.cookies.json"]
-)
-if cookie_list:
-    print("[Info] - Found cookies in secret or files; injecting into browser")
-    inject_cookies_into_driver(bot, cookie_list)
-    time.sleep(2)
-else:
-    # fallback to username/password interactive login (existing behavior)
-    login(bot, username, password)
-
-
-    df = pd.DataFrame({'username': [], 'description': [], 'link': []})
-    df.to_csv('descriptions.csv', encoding='utf-8', index=False)
+    # word list: edit as needed
+    word_list = ['journalist', 'reporter', 'correspondent', 'editor', 'news', 'columnist', 'writer', 'commentator', 'blogger', 'reviewer']
 
     for user in usernames:
         user = user.strip()
-        time.sleep(5)
-        scrape_description(bot, user)
+        if not user:
+            continue
+        try:
+            bio, link = extract_bio_from_profile(driver, user)
+            found = False
+            for word in word_list:
+                if word.lower() in (bio or "").lower() or word.lower() in (link or "").lower():
+                    found = True
+                    break
+            if found:
+                df = pd.concat([df, pd.DataFrame([{'username': user, 'description': bio, 'link': link}])], ignore_index=True)
+                print(f"[main] matched {user}")
+            else:
+                print(f"[main] no match for {user}")
+            # polite small delay
+            time.sleep(randint(1,3))
+        except Exception as e:
+            print("Error for", user, e)
+            traceback.print_exc()
+            try:
+                save_debug(driver, user)
+            except Exception:
+                pass
 
-    bot.quit()
+    try:
+        df.to_csv('descriptions.csv', index=False, encoding='utf-8')
+        print("[main] saved descriptions.csv")
+    except Exception as e:
+        print("Failed to save descriptions.csv:", e)
 
+    try:
+        driver.quit()
+    except Exception:
+        pass
 
 if __name__ == '__main__':
-    TIMEOUT = 15
-    scrape()
+    main()

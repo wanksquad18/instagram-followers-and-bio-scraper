@@ -1,21 +1,30 @@
-name: Run Instagram follower scraper (cookies)
+name: Run Instagram scrapers (cookies)
 
 on:
   workflow_dispatch:
     inputs:
-      usernames:
-        description: 'Comma-separated target usernames (e.g. thepreetjohal)'
+      script:
+        description: "Which script to run: followers or bio"
         required: true
-        default: 'thepreetjohal'
+        default: "followers"
+      usernames:
+        description: "Comma-separated usernames (e.g. thepreetjohal)"
+        required: true
+        default: "thepreetjohal"
 
 jobs:
-  scrape:
+  run-scraper:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Show repo files (debug)
+        run: |
+          echo "Repo root listing:"
+          ls -la
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -25,8 +34,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install selenium webdriver-manager
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install selenium webdriver-manager pandas || true
 
       - name: Write cookies secret to file(s)
         env:
@@ -40,30 +49,37 @@ jobs:
           printf '%s' "$COOKIES_SECRET" > data/www.instagram.com.cookies.json
           printf '%s' "$COOKIES_SECRET" > www.instagram.com.cookies.json
           printf '%s' "$COOKIES_SECRET" > cookies/www.instagram.com.cookies.json
-          echo "Cookie files written."
+          echo "Wrote cookies to data/, root and cookies/"
 
-      - name: Run followers scraper
+      - name: Run chosen script
         env:
           COOKIES_SECRET: ${{ secrets.COOKIES_SECRET }}
           TARGET_USERNAMES: ${{ github.event.inputs.usernames }}
         run: |
-          mkdir -p data
-          echo "TARGET_USERNAMES=${TARGET_USERNAMES}"
-          python followers-scraper.py
+          set -euo pipefail
+          echo "Running script: ${{ github.event.inputs.script }}"
+          if [ "${{ github.event.inputs.script }}" = "followers" ]; then
+            python followers-scraper.py
+          elif [ "${{ github.event.inputs.script }}" = "bio" ]; then
+            python bio-scraper.py
+          else
+            echo "Unknown script choice; use 'followers' or 'bio'"
+            exit 1
+          fi
 
       - name: Show results & upload artifacts
         run: |
           echo "=== data listing ==="
           ls -la data || true
-          echo "=== repo root listing ==="
-          ls -la || true
-
+          echo "=== root listing ==="
+          ls -la
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ig-scraper-artifacts
           path: |
-            *.txt
             data/**
+            *_followers.txt
+            *_followers.csv
+            descriptions.csv
             www.instagram.com.cookies.json
-            cookies/www.instagram.com.cookies.json

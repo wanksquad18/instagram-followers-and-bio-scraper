@@ -1,85 +1,113 @@
-name: Run Instagram scrapers (cookies)
+name: Run Instagram followers scraper (cookies)
 
 on:
   workflow_dispatch:
     inputs:
-      script:
-        description: "Which script to run: followers or bio"
-        required: true
-        default: "followers"
       usernames:
-        description: "Comma-separated usernames (e.g. thepreetjohal)"
+        description: "Comma-separated target usernames (e.g. thepreetjohal)"
         required: true
         default: "thepreetjohal"
+      limit:
+        description: "Max followers to collect per target (numeric)"
+        required: false
+        default: "500"
 
 jobs:
-  run-scraper:
+  scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Show repo files (debug)
-        run: |
-          echo "Repo root listing:"
-          ls -la
-
-      - name: Set up Python
+      - name: Set up Python 3.10
         uses: actions/setup-python@v4
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Install system deps for Playwright (browsers)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates libnss3 libatk-bridge2.0-0 libgtk-3-0 libxss1 \
+            libasound2 libasound2-data libgbm1 libglib2.0-0 libx11-6 \
+            libxcomposite1 libxcursor1 libxdamage1 libxrandr2 libxinerama1 \
+            libpangocairo-1.0-0 libpango-1.0-0 libatk1.0-0 libcups2 libnspr4 \
+            libxext6 libffi-dev libx264-dev ffmpeg wget unzip || true
+
+      - name: Install Python packages & Playwright browsers
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install selenium webdriver-manager pandas || true
-
-      - name: Write cookies secret to file(s)
-        env:
-          COOKIES_SECRET: ${{ secrets.COOKIES_SECRET }}
-        run: |
-          mkdir -p data cookies
-          if [ -z "${COOKIES_SECRET:-}" ]; then
-            echo "ERROR: COOKIES_SECRET is empty. Add cookie JSON to repo secrets."
-            exit 1
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install playwright playwright-sync
           fi
-          printf '%s' "$COOKIES_SECRET" > data/www.instagram.com.cookies.json
-          printf '%s' "$COOKIES_SECRET" > www.instagram.com.cookies.json
-          printf '%s' "$COOKIES_SECRET" > cookies/www.instagram.com.cookies.json
-          echo "Wrote cookies to data/, root and cookies/"
+          python -m playwright install --with-deps
 
-      - name: Run chosen script
+      - name: Write cookies from secret to files and validate JSON
+        id: write_cookies
         env:
           COOKIES_SECRET: ${{ secrets.COOKIES_SECRET }}
-          TARGET_USERNAMES: ${{ github.event.inputs.usernames }}
+        shell: bash
         run: |
           set -euo pipefail
-          echo "Running script: ${{ github.event.inputs.script }}"
-          if [ "${{ github.event.inputs.script }}" = "followers" ]; then
-            python followers-scraper.py
-          elif [ "${{ github.event.inputs.script }}" = "bio" ]; then
-            python bio-scraper.py
-          else
-            echo "Unknown script choice; use 'followers' or 'bio'"
+          mkdir -p data cookies
+          if [ -z "${COOKIES_SECRET:-}" ]; then
+            echo "ERROR: COOKIES_SECRET is empty. Add repository secret COOKIES_SECRET with cookie JSON array."
             exit 1
           fi
+          # write cookie json to a few common locations
+          printf "%s" "$COOKIES_SECRET" > www.instagram.com.cookies.json
+          printf "%s" "$COOKIES_SECRET" > data/www.instagram.com.cookies.json
+          printf "%s" "$COOKIES_SECRET" > cookies/www.instagram.com.cookies.json
 
-      - name: Show results & upload artifacts
+          # Validate by running a small python script
+          python - <<'PY'
+import json,sys
+paths = ["www.instagram.com.cookies.json","data/www.instagram.com.cookies.json","cookies/www.instagram.com.cookies.json"]
+ok=False
+for p in paths:
+    try:
+        with open(p,encoding="utf-8") as f:
+            j=json.load(f)
+        if isinstance(j,list):
+            print("OK parse cookie file:",p,"entries:",len(j))
+            ok=True
+            break
+    except Exception as e:
+        print("Failed parse",p,":",e)
+if not ok:
+    print("ERROR: cookie JSON parse failed",file=sys.stderr)
+    sys.exit(2)
+PY
+
+      - name: Run followers scraper
+        env:
+          COOKIE_FILE: data/www.instagram.com.cookies.json
+          TARGET_USERNAMES: ${{ github.event.inputs.usernames }}
+          LIMIT: ${{ github.event.inputs.limit }}
         run: |
-          echo "=== data listing ==="
+          mkdir -p data
+          echo "TARGET_USERNAMES=${TARGET_USERNAMES}"
+          python followers-scraper.py
+
+      - name: Show results preview + data listing
+        run: |
+          echo "=== data/results.csv preview ==="
+          if [ -f data/results.csv ]; then head -n 80 data/results.csv || true; else echo "No data/results.csv produced"; fi
+          echo
+          echo "=== data/ listing ==="
           ls -la data || true
-          echo "=== root listing ==="
-          ls -la
-      - name: Upload artifacts
+
+      - name: Upload artifacts (results + debug)
         uses: actions/upload-artifact@v4
         with:
           name: ig-scraper-artifacts
           path: |
             data/**
-            *_followers.txt
-            *_followers.csv
-            descriptions.csv
+            debug_*.html
+            debug_*.png
             www.instagram.com.cookies.json
+            cookies/www.instagram.com.cookies.json

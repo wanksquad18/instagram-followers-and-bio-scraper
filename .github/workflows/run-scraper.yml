@@ -1,113 +1,46 @@
-name: Run Instagram followers scraper (cookies)
+- name: write_cookies
+  id: write_cookies
+  env:
+    COOKIES_SECRET: ${{ secrets.COOKIES_SECRET }}
+  shell: bash
+  run: |
+    set -euo pipefail
 
-on:
-  workflow_dispatch:
-    inputs:
-      usernames:
-        description: "Comma-separated target usernames (e.g. thepreetjohal)"
-        required: true
-        default: "thepreetjohal"
-      limit:
-        description: "Max followers to collect per target (numeric)"
-        required: false
-        default: "500"
+    mkdir -p data cookies
 
-jobs:
-  scrape:
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
+    if [ -z "${COOKIES_SECRET:-}" ]; then
+      echo "ERROR: COOKIES_SECRET is empty. Add repository secret COOKIES_SECRET with cookie JSON array."
+      exit 1
+    fi
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+    printf '%s' "$COOKIES_SECRET" > www.instagram.com.cookies.json
+    printf '%s' "$COOKIES_SECRET" > data/www.instagram.com.cookies.json
+    printf '%s' "$COOKIES_SECRET" > cookies/www.instagram.com.cookies.json
 
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.10"
+    python - <<'PY'
+import json, sys, os, time
 
-      - name: Install system deps for Playwright (browsers)
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends \
-            ca-certificates libnss3 libatk-bridge2.0-0 libgtk-3-0 libxss1 \
-            libasound2 libasound2-data libgbm1 libglib2.0-0 libx11-6 \
-            libxcomposite1 libxcursor1 libxdamage1 libxrandr2 libxinerama1 \
-            libpangocairo-1.0-0 libpango-1.0-0 libatk1.0-0 libcups2 libnspr4 \
-            libxext6 libffi-dev libx264-dev ffmpeg wget unzip || true
+paths = [
+    "www.instagram.com.cookies.json",
+    "data/www.instagram.com.cookies.json",
+    "cookies/www.instagram.com.cookies.json"
+]
 
-      - name: Install Python packages & Playwright browsers
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install playwright playwright-sync
-          fi
-          python -m playwright install --with-deps
-
-      - name: Write cookies from secret to files and validate JSON
-        id: write_cookies
-        env:
-          COOKIES_SECRET: ${{ secrets.COOKIES_SECRET }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data cookies
-          if [ -z "${COOKIES_SECRET:-}" ]; then
-            echo "ERROR: COOKIES_SECRET is empty. Add repository secret COOKIES_SECRET with cookie JSON array."
-            exit 1
-          fi
-          # write cookie json to a few common locations
-          printf "%s" "$COOKIES_SECRET" > www.instagram.com.cookies.json
-          printf "%s" "$COOKIES_SECRET" > data/www.instagram.com.cookies.json
-          printf "%s" "$COOKIES_SECRET" > cookies/www.instagram.com.cookies.json
-
-          # Validate by running a small python script
-          python - <<'PY'
-import json,sys
-paths = ["www.instagram.com.cookies.json","data/www.instagram.com.cookies.json","cookies/www.instagram.com.cookies.json"]
-ok=False
+ok = False
 for p in paths:
     try:
-        with open(p,encoding="utf-8") as f:
-            j=json.load(f)
-        if isinstance(j,list):
-            print("OK parse cookie file:",p,"entries:",len(j))
-            ok=True
+        with open(p, encoding="utf-8") as f:
+            j = json.load(f)
+        if isinstance(j, list):
+            print("OK parse cookie file:", p, "entries:", len(j))
+            ok = True
             break
+        else:
+            print("Parsed JSON but it's not a list:", p, "type:", type(j).__name__)
     except Exception as e:
-        print("Failed parse",p,":",e)
+        print("Failed to parse", p, ":", repr(e))
+
 if not ok:
-    print("ERROR: cookie JSON parse failed",file=sys.stderr)
-    sys.exit(2)
+    print("ERROR: cookie files not valid JSON list. Make sure COOKIES_SECRET contains a JSON array (e.g. [ {cookie}, {cookie} ])")
+    sys.exit(1)
 PY
-
-      - name: Run followers scraper
-        env:
-          COOKIE_FILE: data/www.instagram.com.cookies.json
-          TARGET_USERNAMES: ${{ github.event.inputs.usernames }}
-          LIMIT: ${{ github.event.inputs.limit }}
-        run: |
-          mkdir -p data
-          echo "TARGET_USERNAMES=${TARGET_USERNAMES}"
-          python followers-scraper.py
-
-      - name: Show results preview + data listing
-        run: |
-          echo "=== data/results.csv preview ==="
-          if [ -f data/results.csv ]; then head -n 80 data/results.csv || true; else echo "No data/results.csv produced"; fi
-          echo
-          echo "=== data/ listing ==="
-          ls -la data || true
-
-      - name: Upload artifacts (results + debug)
-        uses: actions/upload-artifact@v4
-        with:
-          name: ig-scraper-artifacts
-          path: |
-            data/**
-            debug_*.html
-            debug_*.png
-            www.instagram.com.cookies.json
-            cookies/www.instagram.com.cookies.json

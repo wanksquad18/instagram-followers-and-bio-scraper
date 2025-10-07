@@ -1,265 +1,404 @@
-# followers-scraper.py
-# Requires: playwright
-# Usage inside workflow: python followers-scraper.py
-import os, sys, json, csv, time, re
+#!/usr/bin/env python3
+"""
+followers-scraper.py
+
+Playwright-based Instagram followers scraper. Designed to run inside GitHub Actions.
+- Reads cookies from COOKIE_SECRET environment variable (a JSON string), or from
+  COOKIE_FILE (path to JSON) if provided.
+- Converts cookies safely for Playwright.
+- Opens the target profile, clicks Followers (robust selectors), scrolls the followers
+  modal to load followers, and saves follower usernames to CSV.
+
+Usage in Actions (example env):
+  TARGET=username COOKIE_FILE=www.instagram.com.cookies.json python followers-scraper.py
+  or provide COOKIE_SECRET (raw JSON) in GitHub Actions secrets.
+
+Notes:
+ - This script tries to be tolerant of cookie formats (expires / expiry / max-age).
+ - On failure it writes debug HTML and a small PNG to help debugging in CI artifacts.
+"""
+
+import os
+import time
+import json
+import re
+import traceback
+from datetime import datetime
 from typing import List, Dict
+
+import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-COOKIE_PATHS = [
-    os.environ.get("COOKIE_FILE", "data/www.instagram.com.cookies.json"),
-    "www.instagram.com.cookies.json",
-    "cookies/www.instagram.com.cookies.json",
-]
-
-OUTPUT_CSV = "data/results.csv"
-DEBUG_PREFIX = "data/debug"
-
-def load_cookies() -> List[Dict]:
-    # try COOKIE_FILE env first, then common paths
-    for p in COOKIE_PATHS:
-        if p and os.path.exists(p):
-            try:
-                with open(p, encoding="utf-8") as fh:
-                    j = json.load(fh)
-                if isinstance(j, list):
-                    return j
-            except Exception as e:
-                print("Failed parse cookie file", p, ":", e)
-    # fallback: read COOKIES_SECRET env (string)
-    cs = os.environ.get("COOKIES_SECRET")
-    if cs:
+# ---------------------
+# Cookie conversion helpers
+# ---------------------
+def load_cookies_from_env_or_file(cookie_file: str = "www.instagram.com.cookies.json"):
+    """
+    Return a list of cookie dicts. Tries:
+    1) env COOKIE_SECRET (raw JSON string)
+    2) path in COOKIE_FILE env or cookie_file param
+    """
+    if os.getenv("COOKIE_SECRET"):
         try:
-            j = json.loads(cs)
-            if isinstance(j, list):
-                return j
+            data = json.loads(os.getenv("COOKIE_SECRET"))
+            # if a dict with key "cookies"
+            if isinstance(data, dict) and data.get("cookies"):
+                return data["cookies"]
+            if isinstance(data, list):
+                return data
         except Exception as e:
-            print("Failed parse COOKIES_SECRET env:", e)
-    raise RuntimeError("No cookie JSON found. Place cookie JSON file or set COOKIES_SECRET env.")
+            print("Failed to parse COOKIE_SECRET:", e)
+
+    file_path = os.getenv("COOKIE_FILE") or cookie_file
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                if isinstance(data, dict) and data.get("cookies"):
+                    return data["cookies"]
+                if isinstance(data, list):
+                    return data
+        except Exception as e:
+            print("Failed to parse cookie file:", e)
+
+    print("No cookies found in env or file.")
+    return []
 
 def cookies_to_playwright(cookies: List[Dict]) -> List[Dict]:
+    """
+    Convert Chrome-style cookie dicts (or similar) to Playwright cookie format.
+    Ensures expires is an int when present and strips leading '.' from domain.
+    """
     out = []
     for c in cookies:
-        cookie = {}
-        cookie["name"] = c.get("name")
-        cookie["value"] = c.get("value")
-        # Playwright requires "domain" without leading dot works too
+        if not c.get("name") or c.get("value") is None:
+            continue
+        ck = {"name": str(c.get("name")), "value": str(c.get("value"))}
+
+        # normalize domain
         domain = c.get("domain") or c.get("host") or "www.instagram.com"
-        cookie["domain"] = domain
-        # path, expires, httpOnly, secure
+        if isinstance(domain, str):
+            ck["domain"] = domain.lstrip(".")
+        else:
+            ck["domain"] = "www.instagram.com"
+
+        # path
         if c.get("path"):
-            cookie["path"] = c.get("path")
-        if c.get("expires") and isinstance(c.get("expires"), (int, float)):
-            cookie["expires"] = int(c.get("expires"))
+            ck["path"] = c.get("path")
+
+        # expiry/expires parsing
+        exp_val = None
+        for k in ("expires", "expiry"):
+            v = c.get(k)
+            if v is None:
+                continue
+            try:
+                if isinstance(v, str) and v.isdigit():
+                    exp_val = int(v)
+                else:
+                    exp_val = int(float(v))
+            except Exception:
+                exp_val = None
+            if exp_val:
+                ck["expires"] = exp_val
+                break
+
+        # fallback: max-age
+        if "expires" not in ck and c.get("max-age"):
+            try:
+                ma = int(c.get("max-age"))
+                if ma > 0:
+                    ck["expires"] = int(time.time()) + ma
+            except Exception:
+                pass
+
         if c.get("httpOnly") is not None:
-            cookie["httpOnly"] = bool(c.get("httpOnly"))
+            ck["httpOnly"] = bool(c.get("httpOnly"))
         if c.get("secure") is not None:
-            cookie["secure"] = bool(c.get("secure"))
-        out.append(cookie)
+            ck["secure"] = bool(c.get("secure"))
+
+        out.append(ck)
     return out
 
-def save_debug_html_png(page, name):
-    safe = re.sub(r'[^0-9A-Za-z._-]', '_', name)[:60]
-    ts = int(time.time())
-    os.makedirs("data", exist_ok=True)
+# ---------------------
+# Debug helpers
+# ---------------------
+def save_debug_html(page, prefix="debug"):
     try:
         html = page.content()
-        path_html = f"{DEBUG_PREFIX}_{safe}_{ts}.html"
-        with open(path_html, "w", encoding="utf-8") as fh:
+        filename = f"{prefix}_{int(time.time())}.html"
+        with open(filename, "w", encoding="utf-8") as fh:
             fh.write(html)
-        print("Wrote debug html:", path_html)
+        print("Wrote debug HTML:", filename)
     except Exception as e:
-        print("Failed to write debug html:", e)
+        print("Failed to save debug HTML:", e)
+
+def save_debug_screenshot(page, prefix="debug"):
     try:
-        path_png = f"{DEBUG_PREFIX}_{safe}_{ts}.png"
-        page.screenshot(path=path_png, full_page=True)
-        print("Wrote debug png:", path_png)
+        filename = f"{prefix}_{int(time.time())}.png"
+        page.screenshot(path=filename, full_page=True)
+        print("Wrote debug screenshot:", filename)
     except Exception as e:
-        print("Failed to screenshot page:", e)
+        print("Failed to save debug screenshot:", e)
 
-def extract_user_from_href(href: str):
-    # href like "/username/" or "/username"
-    if not href:
-        return None
-    m = re.match(r"^/([^/]+)/?$", href)
-    if m:
-        return m.group(1)
-    return None
+# ---------------------
+# Followers extraction
+# ---------------------
+def extract_usernames_from_dialog(page) -> List[str]:
+    """
+    Given a page with the followers dialog open, try to extract usernames loaded
+    in the modal. Returns unique usernames (strings).
+    This function is defensive because IG's DOM changes a lot.
+    """
+    usernames = set()
 
-def scrape_followers_of(target: str, max_followers: int = 500):
-    print("Scraping followers for:", target, "limit:", max_followers)
-    cookies = load_cookies()
-    p_cookies = cookies_to_playwright(cookies)
-    os.makedirs("data", exist_ok=True)
+    # We will look for list items inside dialog: 'div[role="dialog"] ul li'
+    try:
+        dialog_ul = page.locator('div[role="dialog"] ul')
+        count = dialog_ul.count()
+        if count == 0:
+            # alternate path: some layouts use other containers
+            dialog_ul = page.locator('div[role="dialog"]').locator('li')
+        # Query all list items inside dialog
+        items = page.locator('div[role="dialog"] ul li')
+        n = items.count()
+        for i in range(n):
+            try:
+                item = items.nth(i)
+                # Try to find an anchor with href that looks like "/username/"
+                a = item.locator('a').first
+                if a.count() > 0:
+                    href = a.get_attribute("href") or ""
+                    # href may be full URL; extract username
+                    m = re.search(r"instagram\.com\/([^\/\?]+)", href)
+                    if m:
+                        usernames.add(m.group(1))
+                        continue
+                    # fallback: a.textContent might include username or full name
+                    text = a.inner_text().strip()
+                    # username is often the first token without spaces and not containing spaces
+                    if text and " " not in text:
+                        usernames.add(text)
+                        continue
+                # fallback: sometimes username appears in span/div
+                txt = item.inner_text().strip()
+                # try to find @username-like token or first token that looks like a username
+                m2 = re.search(r'@?([A-Za-z0-9._]{3,30})', txt)
+                if m2:
+                    usernames.add(m2.group(1))
+            except Exception:
+                continue
+    except Exception as e:
+        print("extract_usernames_from_dialog error:", e)
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = browser.new_context()
-        try:
-            context.add_cookies(p_cookies)
-        except Exception as e:
-            print("Warning: context.add_cookies failed:", e)
-        page = context.new_page()
-        page.set_default_timeout(30000)
-        profile_url = f"https://www.instagram.com/{target}/"
-        try:
-            page.goto(profile_url, wait_until="domcontentloaded")
-        except Exception as e:
-            print("Failed to open profile page:", e)
-            save_debug_html_png(page, target)
-            browser.close()
-            return False
+    return list(usernames)
 
-        # Heuristic: if login page shown -> cookies invalid
-        title = ""
-        try:
-            title = page.title()
-        except Exception:
-            pass
-        if "Log in" in title or "Login" in title or "Sign up" in title:
-            print("Login page detected. Cookies invalid or blocked. Title:", title)
-            save_debug_html_png(page, target)
-            browser.close()
-            return False
+def scroll_followers_modal(page, target_username: str, max_seconds=25):
+    """
+    Scroll inside followers modal to load more entries. Returns when timeout hit.
+    """
+    start = time.time()
+    last_height = -1
+    try:
+        # locate the scrollable UL inside dialog
+        ul = page.locator('div[role="dialog"] ul')
+        if ul.count() == 0:
+            # Sometimes the structure differs; try any scrollable container inside dialog
+            ul = page.locator('div[role="dialog"]').locator('div').filter(has_text="followers").first
+        # We'll repeatedly evaluate JS to scroll the container
+        while time.time() - start < max_seconds:
+            # run JS to scroll the first matching element
+            page.evaluate(
+                """() => {
+                    const dlg = document.querySelector('div[role="dialog"] ul');
+                    if (!dlg) return 0;
+                    dlg.scrollTop = dlg.scrollHeight;
+                    return dlg.scrollHeight;
+                }"""
+            )
+            time.sleep(0.6)
+    except Exception as e:
+        # Non-fatal: if scroll fails, continue; we still try to extract whatever loaded
+        print("scroll_followers_modal exception (non-fatal):", e)
 
-        # try click followers link
-        try:
-            # prefer exact href match
-            selector_link = f'a[href="/{target}/followers/"]'
-            if page.locator(selector_link).count() > 0:
-                page.locator(selector_link).first.click()
-            else:
-                # fallback to link with 'followers' text
-                candidate = page.locator('a').filter(has_text='followers').first
-                if candidate.count() > 0:
-                    candidate.click()
+# ---------------------
+# Main scraping routine
+# ---------------------
+def scrape_followers_for(target: str, cookie_list: List[Dict], headless=True, max_followers=500):
+    """
+    Returns True on success (wrote CSV), False otherwise.
+    """
+    playwright_cookies = cookies_to_playwright(cookie_list)
+    if not playwright_cookies:
+        print("No valid cookies to set for Playwright. Aborting.")
+        return False
+
+    csv_path = f"{target}_followers.csv"
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless, args=["--no-sandbox"])
+            context = browser.new_context()
+            # set cookies in context (domain included in each cookie)
+            try:
+                context.add_cookies(playwright_cookies)
+                print(f"Added {len(playwright_cookies)} cookies to Playwright context.")
+            except Exception as e:
+                print("context.add_cookies failed:", e)
+                # still try: proceed without cookies (will likely show login)
+            page = context.new_page()
+            # go to profile directly
+            profile_url = f"https://www.instagram.com/{target}/"
+            print("Navigating to", profile_url)
+            page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=15000)
+            time.sleep(0.7)
+            page.goto(profile_url, wait_until="domcontentloaded", timeout=20000)
+            time.sleep(1.2)
+
+            # detect login page heuristics
+            title = page.title().lower()
+            page_html = page.content().lower()
+            if "log in" in title or "login" in title or "sign up" in title or "password" in page_html:
+                print("Login page detected. Cookies invalid or blocked. Title:", page.title())
+                save_debug_html(page, prefix=f"debug_{target}")
+                save_debug_screenshot(page, prefix=f"debug_{target}")
+                context.close()
+                browser.close()
+                return False
+
+            # Try to click the followers link robustly.
+            clicked = False
+            try:
+                # 1) href starting with /{target}/followers (covers trailing slash or not)
+                selector_href = f'a[href^="/{target}/followers"]'
+                if page.locator(selector_href).count() > 0:
+                    page.locator(selector_href).first.click()
+                    clicked = True
                 else:
-                    print("Followers link not found on page. Saving debug.")
-                    save_debug_html_png(page, target)
+                    # 2) any anchor with visible text 'followers' (case-insensitive)
+                    anchors = page.locator('a').all()
+                    found = False
+                    for i in range(page.locator('a').count()):
+                        a = page.locator('a').nth(i)
+                        try:
+                            txt = a.inner_text().strip()
+                        except Exception:
+                            txt = ""
+                        if re.search(r'(?i)followers', txt):
+                            try:
+                                a.click()
+                                clicked = True
+                                found = True
+                                break
+                            except Exception:
+                                continue
+                    if not found:
+                        # 3) sometimes stats are in header as <li> elements - try clicking any element containing 'followers'
+                        candidates = page.locator('header').locator('a, span, li')
+                        for i in range(candidates.count()):
+                            c = candidates.nth(i)
+                            try:
+                                txt = c.inner_text().strip()
+                            except Exception:
+                                txt = ""
+                            if re.search(r'(?i)followers', txt):
+                                try:
+                                    c.click()
+                                    clicked = True
+                                    break
+                                except Exception:
+                                    continue
+
+                if not clicked:
+                    print("Followers link not found on profile page. Saving debug.")
+                    save_debug_html(page, prefix=f"debug_{target}")
+                    save_debug_screenshot(page, prefix=f"debug_{target}")
+                    context.close()
                     browser.close()
                     return False
-        except PWTimeout as e:
-            print("Timeout clicking followers link:", e)
-            save_debug_html_png(page, target)
-            browser.close()
-            return False
-        except Exception as e:
-            print("Exception clicking followers link:", e)
-            save_debug_html_png(page, target)
-            browser.close()
-            return False
-
-        # Wait for modal
-        try:
-            modal_selector = 'div[role="dialog"] ul'
-            page.wait_for_selector(modal_selector, timeout=10000)
-            modal = page.locator(modal_selector).first
-        except Exception as e:
-            print("Followers modal did not appear:", e)
-            save_debug_html_png(page, target)
-            browser.close()
-            return False
-
-        # Scroll modal and collect
-        collected = {}
-        last_len = -1
-        scroll_tries = 0
-        print("Begin scrolling modal to collect followers...")
-        while len(collected) < max_followers and scroll_tries < 400:
-            # collect anchors in modal and extract username + maybe full name
-            anchors = modal.locator('a[href^="/"]')
-            count = anchors.count()
-            for i in range(count):
-                try:
-                    href = anchors.nth(i).get_attribute("href")
-                    user = extract_user_from_href(href)
-                    if not user:
-                        continue
-                    if user in collected:
-                        continue
-                    # attempt to also get visible display name/full name near the anchor
-                    # The anchor usually contains inner text with username/full name; we'll try:
-                    try:
-                        # get text content of parent/ancestor for human-friendly name
-                        parent_text = anchors.nth(i).inner_text().strip()
-                        # inner_text sometimes contains username + full name, split by newline
-                        parts = [p.strip() for p in parent_text.splitlines() if p.strip()]
-                        full_name = parts[1] if len(parts) > 1 else ""
-                    except Exception:
-                        full_name = ""
-                    collected[user] = full_name
-                except Exception:
-                    continue
-
-            # scroll inside modal
-            try:
-                page.evaluate("""(sel) => {
-                    const el = document.querySelector(sel);
-                    if (!el) return 0;
-                    el.scrollTop = el.scrollHeight;
-                    return el.scrollHeight;
-                }""", modal_selector)
+            except PWTimeout as e:
+                print("Timeout while trying to locate/click followers link:", e)
+                save_debug_html(page, prefix=f"debug_{target}")
+                save_debug_screenshot(page, prefix=f"debug_{target}")
+                context.close()
+                browser.close()
+                return False
             except Exception as e:
-                print("Scroll evaluate error:", e)
-            time.sleep(0.35)
-            if len(collected) == last_len:
-                scroll_tries += 1
+                print("Exception clicking followers link:", e)
+                save_debug_html(page, prefix=f"debug_{target}")
+                save_debug_screenshot(page, prefix=f"debug_{target}")
+                context.close()
+                browser.close()
+                return False
+
+            # At this point followers dialog should be open. Wait a bit.
+            time.sleep(1.0)
+            # Scroll modal to load followers
+            scroll_followers_modal(page, target, max_seconds=20)
+
+            # Extract usernames
+            followers = []
+            try:
+                followers = extract_usernames_from_dialog(page)
+            except Exception as e:
+                print("Error extracting usernames:", e)
+
+            # If we didn't find many, try a second pass after some scrolling
+            if len(followers) < 10:
+                scroll_followers_modal(page, target, max_seconds=10)
+                more = extract_usernames_from_dialog(page)
+                for u in more:
+                    if u not in followers:
+                        followers.append(u)
+
+            # Trim to max_followers if requested
+            if len(followers) > max_followers:
+                followers = followers[:max_followers]
+
+            # Save to CSV
+            if followers:
+                df = pd.DataFrame([{"username": u, "scraped_at": datetime.utcnow().isoformat()} for u in followers])
+                df.to_csv(f"{target}_followers.csv", index=False)
+                print(f"Wrote {len(followers)} followers to {target}_followers.csv")
+                context.close()
+                browser.close()
+                return True
             else:
-                last_len = len(collected)
-                scroll_tries = 0
+                print("No followers extracted. Saving debug.")
+                save_debug_html(page, prefix=f"debug_{target}")
+                save_debug_screenshot(page, prefix=f"debug_{target}")
+                context.close()
+                browser.close()
+                return False
 
-        print("Collected usernames:", len(collected))
-        # write out results
-        with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as fh:
-            w = csv.writer(fh)
-            w.writerow(["username","full_name","source_profile","collected_at"])
-            for u, full in collected.items():
-                w.writerow([u, full, target, int(time.time())])
+    except Exception as e:
+        print("Unexpected exception in scrape_followers_for:", e)
+        traceback.print_exc()
+        return False
 
-        browser.close()
-    return True
-
+# ---------------------
+# Main
+# ---------------------
 def main():
-    targets = os.environ.get("TARGET_USERNAMES","thepreetjohal")
-    limit = int(os.environ.get("LIMIT","500") or 500)
-    targets_list = [t.strip() for t in targets.split(",") if t.strip()]
-    if not targets_list:
-        print("No targets provided. Set TARGET_USERNAMES env or input in workflow.")
-        sys.exit(1)
-    all_success = True
-    # run per-target and append results (if multiple targets, combine)
-    os.makedirs("data", exist_ok=True)
-    overall_rows = []
-    for t in targets_list:
-        ok = scrape_followers_of(t, max_followers=limit)
-        if not ok:
-            print("Profile failed:", t)
-            all_success = False
-        # if scraper produced data/results.csv (per-run), merge
-        csv_path = OUTPUT_CSV
-        if os.path.exists(csv_path):
-            # load and append to overall_rows, then move aside to avoid overwrite
-            try:
-                import csv as _csv
-                with open(csv_path, newline="", encoding="utf-8") as f:
-                    rdr = _csv.DictReader(f)
-                    for r in rdr:
-                        overall_rows.append(r)
-                # rename last file to keep it (optional)
-                os.rename(csv_path, f"data/results_{t}_{int(time.time())}.csv")
-            except Exception as e:
-                print("Error reading produced csv:", e)
-    # write aggregated final results.csv
-    if overall_rows:
-        with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as fh:
-            w = csv.writer(fh)
-            w.writerow(["username","full_name","source_profile","collected_at"])
-            for r in overall_rows:
-                w.writerow([r.get("username",""), r.get("full_name",""), r.get("source_profile",""), r.get("collected_at","")])
-        print("Wrote aggregated", OUTPUT_CSV, "rows:", len(overall_rows))
+    target = os.getenv("TARGET") or os.getenv("TARGET_USERNAME") or os.getenv("TARGET_USER") or ""
+    if not target:
+        # support TARGET_USERNAMES comma list too; we'll use first
+        tlist = os.getenv("TARGET_USERNAMES") or ""
+        if tlist:
+            target = tlist.split(",")[0].strip()
+
+    if not target:
+        print("Please set TARGET (or TARGET_USERNAMES) environment variable to the username you want to scrape.")
+        return
+
+    cookie_list = load_cookies_from_env_or_file()
+    if isinstance(cookie_list, dict) and cookie_list.get("cookies"):
+        cookie_list = cookie_list["cookies"]
+
+    ok = scrape_followers_for(target, cookie_list, headless=True, max_followers=500)
+    if ok:
+        print("Scraping finished successfully.")
     else:
-        print("No rows collected. data/results.csv not created.")
-    if not all_success:
-        sys.exit(2)
+        print("Scraping failed. See debug artifacts.")
 
 if __name__ == "__main__":
     main()

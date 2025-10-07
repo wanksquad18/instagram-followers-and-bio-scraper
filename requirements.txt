@@ -1,3 +1,5 @@
 selenium==4.21.0
 webdriver_manager
 pandas==2.2.2
+playwright==1.43.0
+playwright-sync==0.0.2
